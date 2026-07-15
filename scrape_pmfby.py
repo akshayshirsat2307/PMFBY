@@ -37,6 +37,7 @@ import csv
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
@@ -122,7 +123,7 @@ def apply_filters(page):
     pass
 
 
-def scrape(url: str, output: str, headless: bool, timeout_ms: int):
+def scrape(url: str, output: str, headless: bool, timeout_ms: int, scraped_at: str):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         context = browser.new_context(
@@ -163,6 +164,12 @@ def scrape(url: str, output: str, headless: bool, timeout_ms: int):
     with out_path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
 
+        # Timestamp header so anyone opening the CSV knows exactly when
+        # this data was pulled.
+        writer.writerow(["Scraped At (UTC)", scraped_at])
+        writer.writerow(["Source URL", url])
+        writer.writerow([])
+
         if stat_cards:
             writer.writerow(["Summary Stats"])
             writer.writerow(["value"])
@@ -182,14 +189,31 @@ def scrape(url: str, output: str, headless: bool, timeout_ms: int):
 
 
 def main():
+    now = datetime.now(timezone.utc)
+    scraped_at_display = now.strftime("%Y-%m-%d %H:%M:%S UTC")
+    scraped_at_filename = now.strftime("%Y%m%d_%H%M%S")
+
     parser = argparse.ArgumentParser(description="Scrape the PMFBY admin statistics dashboard into a CSV.")
     parser.add_argument("--url", default=DASHBOARD_URL, help="Dashboard URL to scrape.")
-    parser.add_argument("--output", default="pmfby_dashboard.csv", help="Output CSV file path.")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help=(
+            "Output CSV file path. If omitted, defaults to "
+            "'data/pmfby_dashboard_<UTC timestamp>.csv' so every run produces "
+            "its own timestamped file instead of overwriting the last one."
+        ),
+    )
     parser.add_argument("--headed", action="store_true", help="Run browser with a visible window (for debugging).")
     parser.add_argument("--timeout", type=int, default=45000, help="Timeout in ms for page operations.")
     args = parser.parse_args()
 
-    scrape(args.url, args.output, headless=not args.headed, timeout_ms=args.timeout)
+    output = args.output
+    if output is None:
+        Path("data").mkdir(exist_ok=True)
+        output = f"data/pmfby_dashboard_{scraped_at_filename}.csv"
+
+    scrape(args.url, output, headless=not args.headed, timeout_ms=args.timeout, scraped_at=scraped_at_display)
 
 
 if __name__ == "__main__":
