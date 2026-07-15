@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""
+scrape_pmfby_statewise.py
+
+Scrapes the "State Wise Report" page of the PMFBY dashboard
+(https://pmfby.gov.in/adminStatistics/stateWiseReport) for EVERY
+combination of Year, Season, and Scheme available in its filter
+dropdowns, and saves everything to one CSV with the Year/Season/Scheme
+written as the first columns on every row, followed by the actual
+scraped data - e.g.:
+
+    Year,Season,Scheme,State,Farmers Insured,Area Insured,...
+    2023-24,Kharif,PMFBY,Maharashtra,123456,78910,...
+    2023-24,Kharif,PMFBY,Punjab,...
+    2023-24,Kharif,RWBCIS,Maharashtra,...
+    ...
+
+WHY THIS APPROACH:
+This page is a JS-rendered Angular/React app with no data in the raw
+HTML - everything (including the dropdown options) is injected after
+the page loads. There is no way to hardcode the dropdown element IDs
+without opening a real browser and inspecting the live DOM, which I
+cannot do from where this script was written. Instead, this script:
+
+  1. Loads the page with Playwright (a real headless browser).
+  2. Finds every <select> (or similar dropdown widget) on the page.
+  3. Matches each dropdown to "year" / "season" / "scheme" by reading
+     its associated <label> text (falling back to the dropdown's own
+     name/id/aria-label attributes) - so it doesn't depend on exact
+     element IDs staying the same.
+  4. Enumerate every option in the matched dropdowns and iterates
+     through all combinations, applying each one and re-scraping the
+     results table.
+
+RUN THIS FIRST IN --inspect MODE:
+    python scrape_pmfby_statewise.py --inspect
+This prints every dropdown found on the page along with its detected
+label and options, WITHOUT scraping anything. Check the output:
+  - If "Year", "Season", "Scheme" all show up with sensible option
+    lists, you're good to run the real scrape.
+  - If a dropdown's label doesn't match what you expect (e.g. it says
+    "Insurance Company" instead of "Scheme", or nothing is detected),
+    pass the correct label substring manually with --year-label,
+    --season-label, --scheme-label to override the auto-detection.
+
+USAGE:
+    python scrape_pmfby_statewise.py --inspect
+    python scrape_pmfby_statewise.py
+    python scrape_pmfby_statewise.py --year-label "Fin. Year" --season-label "Season" --scheme-label "Scheme"
+    python scrape_pmfby_statewise.py --headed   # watch it click through combinations
+"""
+
+import argparse
+import csv
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+
+STATEWISE_URL = "https://pmfby.gov.in/adminStatistics/stateWiseReport"
+
+
+def clean_text(s: str) -> str:
+    if s is None:
+        return ""
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def find_label_for_select(page, select_handle) -> str:
+    """
+    Try several strategies to find the human-readable label of a
+    dropdown: an explicit <label for="id">, a wrapping <label>, or
+    aria-label/name/id attributes as a fallback.
+    """
+    el_id = select_handle.get_attribute("id")
+    if el_id:
+        label_el = page.query_selector(f"label[for='{el_id}']")
+        if label_el:
+            text = clean_text(label_el.inner_text())
+            if text:
+                return text
+
+    # Look for a label as an ancestor
+    try:
+        ancestor_label = select_handle.evaluate_handle(
+            "el => el.closest('label') || (el.parentElement && el.parentElement.querySelector('label'))"
+        )
+        if ancestor_label:
+            text = clean_text(ancestor_label.as_element().inner_text()) if ancestor_label.as_element() else ""
+            if text:
+                return text
+    except Exception:
+        pass
+
+    for attr in ("aria-label", "name", "id", "placeholder"):
+        val = select_handle.get_attribute(attr)
+        if val:
+            return val
+
+    return ""
+
+
+def get_dropdowns(page):
+    """
+    Returns a list of dicts: {handle, label, options: [{value, text}]}
+    for every <select> on the page. Also tries common custom-dropdown
+    patterns (ng-select, mat-select) as a fallback note if no <select>
+    tags are found.
+    """
+    dropdowns = []
+    selects = page.query_selector_all("select")
+    for sel in selects:
+        label = find_label_for_select(page, sel)
+        options = []
+        for opt in sel.query_selector_all("option"):
+            val = opt.get_attribute("value") or ""
+            text = clean_text(opt.inner_text())
+            if text:
+                options.append({"value": val, "text": text})
+        dropdowns.append({"handle": sel, "label": label, "options": options})
+    return dropdowns
+
+
+def inspect_mode(page):
+    dropdowns = get_dropdowns(page)
+    if not dropdowns:
+        print(
+            "No <select> elements found. This page may use a custom "
+            "component (e.g. ng-select / mat-select / a styled div "
+            "acting as a dropdown) instead of a native <select>. Run "
+            "with --headed, open DevTools, and inspect the Year/Season/"
+            "Scheme filters directly - then let me know the element "
+            "structure and I'll adjust the script."
+        )
+        return
+    print(f"Found {len(dropdowns)} dropdown(s):\n")
+    for i, d in enumerate(dropdowns):
+        print(f"[{i}] Detected label: {d['label']!r}")
+        for o in d["options"]:
+            print(f"      value={o['value']!r}  text={o['text']!r}")
+        print()
+
+
+def match_dropdown(dropdowns, keyword):
+    keyword = keyword.lower()
+    for d in dropdowns:
+        if keyword in d["label"].lower():
+            return d
+    return None
+
+
+def extract_table(page):
+    """Grab the first data table on the page as (headers, rows)."""
+    table = page.query_selector("table")
+    if not table:
+        return [], []
+    headers = [clean_text(th.inner_text()) for th in table.query_selector_all("thead th")]
+    body_rows = table.query_selector_all("tbody tr")
+    if not body_rows:
+        all_rows = table.query_selector_all("tr")
+        body_rows = all_rows[1:] if len(all_rows) > 1 else all_rows
+    rows = []
+    for r in body_rows:
+        cells = [clean_text(c.inner_text()) for c in r.query_selector_all("td, th")]
+        if any(cells):
+            rows.append(cells)
+    return headers, rows
+
+
+def select_option_safely(page, select_handle, option_value, option_text):
+    """
+    Select an option by value, falling back to label text, then wait a
+    beat for the page to react (many of these dashboards auto-refresh
+    the table on change; some need an explicit Search/Submit button).
+    """
+    try:
+        select_handle.select_option(value=option_value)
+    except Exception:
+        try:
+            select_handle.select_option(label=option_text)
+        except Exception as e:
+            print(f"  Could not select option {option_text!r}: {e}")
+            return False
+    page.wait_for_timeout(1500)
+
+    # If there's an obvious Search/Submit/Go button, click it.
+    for sel in ["button:has-text('Search')", "button:has-text('Submit')", "button:has-text('Go')"]:
+        btn = page.query_selector(sel)
+        if btn:
+            try:
+                btn.click()
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
+            break
+    return True
+
+
+def run(url, output, headless, timeout_ms, inspect, year_label, season_label, scheme_label):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        page = browser.new_context().new_page()
+        page.set_default_timeout(timeout_ms)
+
+        print(f"Loading {url} ...")
+        try:
+            page.goto(url, wait_until="networkidle")
+        except PWTimeoutError:
+            print("Warning: networkidle timeout, continuing anyway.")
+        page.wait_for_timeout(3000)
+
+        if inspect:
+            inspect_mode(page)
+            browser.close()
+            return
+
+        dropdowns = get_dropdowns(page)
+        year_dd = match_dropdown(dropdowns, year_label)
+        season_dd = match_dropdown(dropdowns, season_label)
+        scheme_dd = match_dropdown(dropdowns, scheme_label)
+
+        missing = [name for name, dd in [("year", year_dd), ("season", season_dd), ("scheme", scheme_dd)] if dd is None]
+        if missing:
+            print(f"Could not auto-detect dropdown(s) for: {missing}.")
+            print("Run with --inspect to see what was found, then pass --year-label / --season-label / --scheme-label.")
+            browser.close()
+            return
+
+        year_options = year_dd["options"]
+        season_options = season_dd["options"]
+        scheme_options = scheme_dd["options"]
+
+        print(
+            f"Iterating {len(year_options)} year(s) x {len(season_options)} season(s) "
+            f"x {len(scheme_options)} scheme(s) = "
+            f"{len(year_options) * len(season_options) * len(scheme_options)} combinations."
+        )
+
+        all_rows = []
+        combined_headers = None
+
+        for y in year_options:
+            for s in season_options:
+                for sc in scheme_options:
+                    print(f"  -> Year={y['text']} Season={s['text']} Scheme={sc['text']}")
+                    # Re-fetch fresh handles each loop - the DOM may have
+                    # been re-rendered after the previous selection.
+                    dropdowns = get_dropdowns(page)
+                    year_dd = match_dropdown(dropdowns, year_label)
+                    season_dd = match_dropdown(dropdowns, season_label)
+                    scheme_dd = match_dropdown(dropdowns, scheme_label)
+
+                    select_option_safely(page, year_dd["handle"], y["value"], y["text"])
+                    select_option_safely(page, season_dd["handle"], s["value"], s["text"])
+                    select_option_safely(page, scheme_dd["handle"], sc["value"], sc["text"])
+
+                    headers, rows = extract_table(page)
+                    if combined_headers is None and headers:
+                        combined_headers = headers
+
+                    if not rows:
+                        print("     (no data returned for this combination, skipping)")
+                        continue
+
+                    for row in rows:
+                        all_rows.append([y["text"], s["text"], sc["text"]] + row)
+
+        browser.close()
+
+    out_path = Path(output)
+    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        writer.writerow(["Scraped At (UTC)", now])
+        writer.writerow(["Source URL", url])
+        writer.writerow([])
+        header_row = ["Year", "Season", "Scheme"] + (combined_headers or ["Data"])
+        writer.writerow(header_row)
+        writer.writerows(all_rows)
+
+    print(f"Saved {len(all_rows)} row(s) to {out_path.resolve()}")
+
+
+def main():
+    now = datetime.now(timezone.utc)
+    ts = now.strftime("%Y%m%d_%H%M%S")
+
+    parser = argparse.ArgumentParser(description="Scrape PMFBY State Wise Report across Year/Season/Scheme.")
+    parser.add_argument("--url", default=STATEWISE_URL)
+    parser.add_argument("--output", default=None, help="Defaults to data/pmfby_statewise_<timestamp>.csv")
+    parser.add_argument("--headed", action="store_true")
+    parser.add_argument("--timeout", type=int, default=45000)
+    parser.add_argument("--inspect", action="store_true", help="List detected dropdowns/options and exit - no scraping.")
+    parser.add_argument("--year-label", default="year")
+    parser.add_argument("--season-label", default="season")
+    parser.add_argument("--scheme-label", default="scheme")
+    args = parser.parse_args()
+
+    output = args.output
+    if output is None:
+        Path("data").mkdir(exist_ok=True)
+        output = f"data/pmfby_statewise_{ts}.csv"
+
+    run(
+        args.url, output, headless=not args.headed, timeout_ms=args.timeout,
+        inspect=args.inspect, year_label=args.year_label,
+        season_label=args.season_label, scheme_label=args.scheme_label,
+    )
+
+
+if __name__ == "__main__":
+    main()
