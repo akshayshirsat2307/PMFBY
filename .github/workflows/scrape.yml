@@ -26,12 +26,14 @@ jobs:
           playwright install --with-deps chromium
 
       - name: Run scraper
-        run: python scrape_pmfby.py --output pmfby_dashboard.csv
+        run: python scrape_pmfby.py
+        # No --output given: the script auto-generates
+        # data/pmfby_dashboard_<UTC timestamp>.csv for this run.
 
       - name: Commit CSV if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pmfby_dashboard.csv
-          git diff --cached --quiet || git commit -m "Update PMFBY dashboard data ($(date -u +%Y-%m-%d))"
+          git add data/
+          git diff --cached --quiet || git commit -m "Add PMFBY dashboard data ($(date -u +%Y-%m-%d))"
           git push
